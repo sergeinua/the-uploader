@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>@tusd-tracker/core - Browser Demo</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    h1 { color: #333; }
+    .dropzone {
+      border: 2px dashed #ccc;
+      border-radius: 8px;
+      padding: 40px;
+      text-align: center;
+      background: #fff;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+    .dropzone.dragover { border-color: #007bff; background: #e8f4ff; }
+    .dropzone p { margin: 0; color: #666; }
+    .controls {
+      margin: 20px 0;
+      display: flex;
+      gap: 10px;
+    }
+    button {
+      padding: 8px 16px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button.primary { background: #007bff; color: white; }
+    button.secondary { background: #6c757d; color: white; }
+    button.danger { background: #dc3545; color: white; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .stats {
+      background: #fff;
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 10px;
+    }
+    .stat { text-align: center; }
+    .stat-value { font-size: 24px; font-weight: bold; color: #007bff; }
+    .stat-label { font-size: 12px; color: #666; }
+    .upload-item {
+      background: #fff;
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 10px;
+    }
+    .upload-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .upload-name { font-weight: 500; }
+    .upload-status {
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+    .status-queued { background: #e9ecef; }
+    .status-uploading { background: #cce5ff; color: #004085; }
+    .status-done { background: #d4edda; color: #155724; }
+    .status-failed { background: #f8d7da; color: #721c24; }
+    .status-paused { background: #fff3cd; color: #856404; }
+    .status-recovering { background: #d1ecf1; color: #0c5460; }
+    .progress-bar {
+      height: 8px;
+      background: #e9ecef;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: #28a745;
+      transition: width 0.2s;
+    }
+    .upload-meta {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: #666;
+      margin-top: 8px;
+    }
+    .upload-actions {
+      display: flex;
+      gap: 5px;
+      margin-top: 10px;
+    }
+    .upload-actions button {
+      padding: 4px 8px;
+      font-size: 12px;
+    }
+    .log {
+      background: #1e1e1e;
+      color: #d4d4d4;
+      padding: 15px;
+      border-radius: 8px;
+      max-height: 200px;
+      overflow-y: auto;
+      font-family: 'Consolas', monospace;
+      font-size: 12px;
+    }
+    .log-entry { margin: 2px 0; }
+    .log-time { color: #569cd6; }
+    .empty-state {
+      text-align: center;
+      padding: 40px;
+      color: #666;
+    }
+  </style>
+</head>
+<body>
+  <h1>@tusd-tracker/core Demo</h1>
+  
+  <div class="dropzone" id="dropzone">
+    <p>Drag & drop files here or click to select</p>
+    <input type="file" id="fileInput" multiple style="display: none;">
+  </div>
+
+  <div class="controls">
+    <button class="primary" id="resumeAll">Resume All</button>
+    <button class="secondary" id="pauseAll">Pause All</button>
+    <button class="danger" id="retryFailed">Retry Failed</button>
+    <button id="clearCompleted">Clear Completed</button>
+  </div>
+
+  <div class="stats" id="stats">
+    <div class="stat">
+      <div class="stat-value" id="stat-total">0</div>
+      <div class="stat-label">Total</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value" id="stat-uploading">0</div>
+      <div class="stat-label">Uploading</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value" id="stat-done">0</div>
+      <div class="stat-label">Done</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value" id="stat-failed">0</div>
+      <div class="stat-label">Failed</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value" id="stat-speed">0 B/s</div>
+      <div class="stat-label">Speed</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value" id="stat-percent">0%</div>
+      <div class="stat-label">Overall</div>
+    </div>
+  </div>
+
+  <div id="uploads"></div>
+
+  <h2>Event Log</h2>
+  <div class="log" id="log"></div>
+
+  <script type="module">
+    // Import from local build (for development)
+    // In production, use: import { TusdTracker } from '@tusd-tracker/core';
+    import { TusdTracker, formatBytes, formatSpeed, formatEta } from '../../dist/esm/index.js';
+
+    const TUSD_ENDPOINT = 'http://localhost:1080/files/';
+
+    const tracker = new TusdTracker({
+      endpoint: TUSD_ENDPOINT,
+      chunkSize: 2 * 1024 * 1024, // 2MB chunks
+      maxRetries: 5,
+      parallelUploads: 3,
+      onProgress: (entry) => {
+        renderUpload(entry);
+      },
+      onComplete: (entry) => {
+        log(`Upload complete: ${entry.file.name}`);
+        renderUpload(entry);
+      },
+      onError: (entry, error) => {
+        log(`Upload failed: ${entry.file.name} - ${error.message}`);
+        renderUpload(entry);
+      },
+      onStatsUpdate: (stats) => {
+        renderStats(stats);
+      },
+    });
+
+    // Event subscriptions
+    tracker.on('entry:done', (entry) => {
+      log(`Event: entry:done - ${entry.id.slice(0, 8)}...`);
+    });
+
+    tracker.on('entry:failed', (entry) => {
+      log(`Event: entry:failed - ${entry.id.slice(0, 8)}...`);
+    });
+
+    tracker.on('stats:update', (stats) => {
+      // Stats are also handled by onStatsUpdate
+    });
+
+    // DOM elements
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('fileInput');
+    const uploadsContainer = document.getElementById('uploads');
+    const logContainer = document.getElementById('log');
+
+    // Dropzone handlers
+    dropzone.addEventListener('click', () => fileInput.click());
+    
+    dropzone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dropzone.classList.add('dragover');
+    });
+
+    dropzone.addEventListener('dragleave', () => {
+      dropzone.classList.remove('dragover');
+    });
+
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('dragover');
+      handleFiles(e.dataTransfer.files);
+    });
+
+    fileInput.addEventListener('change', (e) => {
+      handleFiles(e.target.files);
+    });
+
+    // Control buttons
+    document.getElementById('resumeAll').addEventListener('click', () => {
+      tracker.resumeAll();
+      log('Resumed all uploads');
+    });
+
+    document.getElementById('pauseAll').addEventListener('click', () => {
+      tracker.pauseAll();
+      log('Paused all uploads');
+    });
+
+    document.getElementById('retryFailed').addEventListener('click', () => {
+      tracker.retryFailed();
+      log('Retrying failed uploads');
+    });
+
+    document.getElementById('clearCompleted').addEventListener('click', () => {
+      tracker.clearCompleted();
+      renderAll();
+      log('Cleared completed uploads');
+    });
+
+    function handleFiles(files) {
+      if (!files.length) return;
+      
+      const ids = tracker.add(Array.from(files));
+      log(`Added ${files.length} file(s): ${ids.length} upload(s) started`);
+      renderAll();
+    }
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      const entry = document.createElement('div');
+      entry.className = 'log-entry';
+      entry.innerHTML = `<span class="log-time">[${time}]</span> ${message}`;
+      logContainer.prepend(entry);
+    }
+
+    function renderStats(stats) {
+      document.getElementById('stat-total').textContent = stats.total;
+      document.getElementById('stat-uploading').textContent = stats.uploading;
+      document.getElementById('stat-done').textContent = stats.done;
+      document.getElementById('stat-failed').textContent = stats.failed;
+      document.getElementById('stat-speed').textContent = formatSpeed(stats.currentSpeed);
+      document.getElementById('stat-percent').textContent = stats.overallPercent.toFixed(1) + '%';
+    }
+
+    function renderUpload(entry) {
+      let el = document.getElementById(`upload-${entry.id}`);
+      
+      if (!el) {
+        el = document.createElement('div');
+        el.id = `upload-${entry.id}`;
+        el.className = 'upload-item';
+        uploadsContainer.prepend(el);
+      }
+
+      const statusClass = `status-${entry.status}`;
+      
+      el.innerHTML = `
+        <div class="upload-header">
+          <span class="upload-name">${entry.file.name}</span>
+          <span class="upload-status ${statusClass}">${entry.status}</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" style="width: ${entry.percent}%"></div>
+        </div>
+        <div class="upload-meta">
+          <span>${formatBytes(entry.bytesUploaded)} / ${formatBytes(entry.bytesTotal)}</span>
+          <span>${formatSpeed(entry.speed)} • ETA: ${formatEta(entry.eta)}</span>
+        </div>
+        <div class="upload-actions">
+          ${entry.status === 'uploading' ? 
+            `<button onclick="window.tracker.pause('${entry.id}')">Pause</button>` : 
+            ''}
+          ${entry.status === 'paused' ? 
+            `<button onclick="window.tracker.resume('${entry.id}')">Resume</button>` : 
+            ''}
+          ${entry.status !== 'done' && entry.status !== 'cancelled' ? 
+            `<button onclick="window.tracker.cancel('${entry.id}')" style="color: #dc3545;">Cancel</button>` : 
+            ''}
+        </div>
+      `;
+    }
+
+    function renderAll() {
+      const entries = tracker.getEntries();
+      uploadsContainer.innerHTML = '';
+      for (const entry of entries) {
+        renderUpload(entry);
+      }
+      renderStats(tracker.getStats());
+    }
+
+    // Initial render
+    renderAll();
+    log('Tracker initialized');
+
+    // Expose tracker globally for inline button handlers
+    window.tracker = tracker;
+  </script>
+</body>
+</html>

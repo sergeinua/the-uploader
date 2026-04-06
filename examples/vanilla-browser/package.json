@@ -1,0 +1,11 @@
+{
+  "name": "tusd-tracker-vanilla-browser",
+  "version": "1.0.0",
+  "description": "Browser vanilla JavaScript example for @tusd-tracker/core",
+  "scripts": {
+    "serve": "npx serve ."
+  },
+  "dependencies": {
+    "@tusd-tracker/core": "file:../.."
+  }
+}

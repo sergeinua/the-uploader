@@ -1,0 +1,15 @@
+{
+  "name": "tusd-tracker-node-example",
+  "version": "1.0.0",
+  "description": "Node.js CLI upload example for @tusd-tracker/core",
+  "type": "module",
+  "scripts": {
+    "upload": "tsx upload.ts"
+  },
+  "dependencies": {
+    "@tusd-tracker/core": "file:../.."
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0"
+  }
+}

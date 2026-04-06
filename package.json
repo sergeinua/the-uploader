@@ -1,0 +1,41 @@
+{
+  "name": "@tusd-tracker/core",
+  "version": "1.0.0",
+  "description": "Framework-agnostic TypeScript uploader with tusd chunk tracking and diagnostics",
+  "keywords": ["tusd", "tus", "upload", "resumable", "tracker", "typescript"],
+  "main": "dist/cjs/index.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js",
+      "types": "./dist/types/index.d.ts"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.cjs.json",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src --ext .ts",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "dependencies": {
+    "tus-js-client": "^3.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "vitest": "^1.2.0",
+    "@vitest/coverage-v8": "^1.2.0",
+    "happy-dom": "^13.0.0",
+    "fake-indexeddb": "^5.0.0",
+    "eslint": "^8.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0"
+  },
+  "peerDependencies": {},
+  "sideEffects": false
+}
