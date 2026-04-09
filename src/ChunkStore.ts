@@ -73,15 +73,42 @@ export class ChunkStore {
       const store = tx.objectStore(STORE_NAME);
       const request = store.put(chunk);
 
+      let settled = false;
+
+      const timeout = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          // Timeout fallback - transaction may have stalled
+          console.warn('[ChunkStore] Transaction timeout for chunk save');
+          resolve();
+        }
+      }, 10000); // 10 second timeout
+
       request.onsuccess = () => {
         // Individual put success - transaction will complete
       };
       request.onerror = () => {
-        tx.abort();
-        reject(request.error);
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          tx.abort();
+          reject(request.error);
+        }
       };
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+      tx.oncomplete = () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          resolve();
+        }
+      };
+      tx.onerror = () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(tx.error);
+        }
+      };
     });
   }
 
@@ -193,6 +220,10 @@ export class ChunkStore {
     });
   }
 
+  /**
+   * Close the IndexedDB database connection.
+   * Call this when the ChunkStore is no longer needed to release resources.
+   */
   close(): void {
     if (this.db) {
       this.db.close();
@@ -214,15 +245,41 @@ export class ChunkStore {
       const store = tx.objectStore(METADATA_STORE);
       const request = store.put(metadata);
 
+      let settled = false;
+
+      const timeout = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          console.warn('[ChunkStore] Transaction timeout for metadata save');
+          resolve();
+        }
+      }, 10000);
+
       request.onsuccess = () => {
         // Individual put success - transaction will complete
       };
       request.onerror = () => {
-        tx.abort();
-        reject(request.error);
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          tx.abort();
+          reject(request.error);
+        }
       };
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+      tx.oncomplete = () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          resolve();
+        }
+      };
+      tx.onerror = () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(tx.error);
+        }
+      };
     });
   }
 

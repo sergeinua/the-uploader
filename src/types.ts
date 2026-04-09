@@ -86,6 +86,7 @@ export interface OffsetDiagnosis {
   serverOffset: number;
   lostBytes: number;
   lostChunkIndexes: number[];
+  markErrors?: Array<{ chunkIndex: number; error: unknown }>;
 }
 
 export interface DiagnosticsPayload {

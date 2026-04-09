@@ -8,7 +8,7 @@ export class HealthChecker {
     this.headers = headers ?? {};
   }
 
-  async getServerOffset(uploadUrl: string): Promise<number | null> {
+  async getServerOffset(uploadUrl: string): Promise<number | undefined> {
     try {
       const response = await fetch(uploadUrl, {
         method: 'HEAD',
@@ -20,12 +20,12 @@ export class HealthChecker {
 
       // 404 or other client errors - upload doesn't exist
       if (response.status === 404) {
-        return null;
+        return undefined;
       }
 
-      // Other HTTP errors - return null for non-success responses
+      // Other HTTP errors - return undefined for non-success responses
       if (!response.ok) {
-        return null;
+        return undefined;
       }
 
       const offsetHeader = response.headers.get('Upload-Offset');
@@ -34,8 +34,8 @@ export class HealthChecker {
       const offset = parseInt(offsetHeader, 10);
       return isNaN(offset) ? 0 : offset;
     } catch {
-      // Network errors - return null to indicate transient failure
-      return null;
+      // Network errors - return undefined to indicate transient failure
+      return undefined;
     }
   }
 
@@ -60,6 +60,7 @@ export class HealthChecker {
     // but are not marked as success
     const lostChunkIndexes: number[] = [];
     let lostBytes = 0;
+    const markErrors: Array<{ chunkIndex: number; error: unknown }> = [];
 
     for (const chunk of chunks) {
       // If server offset is past this chunk's end, but chunk isn't success
@@ -67,8 +68,23 @@ export class HealthChecker {
         lostChunkIndexes.push(chunk.chunkIndex);
         lostBytes += chunk.size;
         // Mark as lost in store
-        await chunkStore.markStatus(uploadId, chunk.chunkIndex, 'lost');
+        try {
+          await chunkStore.markStatus(uploadId, chunk.chunkIndex, 'lost');
+        } catch (error) {
+          markErrors.push({ chunkIndex: chunk.chunkIndex, error });
+          console.error(
+            `[HealthChecker] Failed to mark chunk ${chunk.chunkIndex} as lost:`,
+            error
+          );
+        }
       }
+    }
+
+    // Log if there were marking errors
+    if (markErrors.length > 0) {
+      console.warn(
+        `[HealthChecker] ${markErrors.length} chunk(s) failed to be marked as lost`
+      );
     }
 
     return {

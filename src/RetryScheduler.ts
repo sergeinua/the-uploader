@@ -24,13 +24,13 @@ function buildRetryDelays(
 async function waitForOnline(): Promise<void> {
   if (typeof window === 'undefined' || typeof window.addEventListener === 'undefined') {
     // Node.js - resolve immediately
-    return;
+    return Promise.resolve();
   }
-  
+
   if (navigator.onLine) {
-    return;
+    return Promise.resolve();
   }
-  
+
   return new Promise<void>((resolve) => {
     const handler = () => {
       window.removeEventListener('online', handler);

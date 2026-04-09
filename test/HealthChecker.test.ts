@@ -13,9 +13,9 @@ describe('HealthChecker', () => {
     await chunkStore.clear();
   });
 
-  it('getServerOffset returns null on fetch failure', async () => {
+  it('getServerOffset returns undefined on fetch failure', async () => {
     const offset = await healthChecker.getServerOffset('http://invalid-url/');
-    expect(offset).toBeNull();
+    expect(offset).toBeUndefined();
   });
 
   it('getServerOffset parses Upload-Offset header', async () => {

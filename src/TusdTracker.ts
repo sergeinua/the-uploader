@@ -88,6 +88,7 @@ export class TusdTracker {
 
   // Stats debouncing
   private lastStatsSnapshot: TrackerStats | null = null;
+  private readonly STATS_DEBOUNCE_THRESHOLD = 0.5; // percent change required to emit stats
 
   constructor(config: TusdTrackerConfig) {
     // Validate config values
@@ -133,6 +134,8 @@ export class TusdTracker {
   private startStatsInterval(): void {
     this.statsInterval = globalThis.setInterval(() => {
       this.emitStats();
+      // Periodically clean up idle speed samples to prevent memory leaks
+      this.speedTracker.cleanupIdle();
     }, 500);
   }
 
@@ -295,6 +298,7 @@ export class TusdTracker {
 
     this.speedTracker.reset(uploadId);
     this.speedTracker.cleanupIdle();
+    this.lastProgressEmit.delete(uploadId);
     this.emit('entry:cancelled', entry);
     this.emitStats();
   }
@@ -645,14 +649,14 @@ export class TusdTracker {
 
   /**
    * Sanitize metadata to prevent header injection attacks.
-   * Only allows alphanumeric keys with hyphens and underscores.
+   * Allows alphanumeric keys with hyphens, underscores, and dots.
    * Removes carriage returns and newlines from values.
    */
   private sanitizeMetadata(metadata: Record<string, string>): Record<string, string> {
     const sanitized: Record<string, string> = {};
     for (const [key, value] of Object.entries(metadata)) {
-      // Only allow alphanumeric keys with hyphens and underscores
-      if (/^[a-zA-Z0-9_-]+$/.test(key)) {
+      // Allow alphanumeric keys with hyphens, underscores, and dots (e.g., user.id, content.type)
+      if (/^[a-zA-Z0-9_.-]+$/.test(key)) {
         // Remove carriage returns and newlines to prevent header injection
         sanitized[key] = value.replace(/[\r\n]/g, '');
       }
@@ -828,6 +832,7 @@ export class TusdTracker {
     this.debug('Upload completed:', uploadId, entry.file.name);
     this.tusUploads.delete(uploadId);
     this.speedTracker.reset(uploadId);
+    this.lastProgressEmit.delete(uploadId);
 
     this.updateEntry(uploadId, {
       status: 'done',
@@ -857,6 +862,7 @@ export class TusdTracker {
     if (classification === 'non-retryable') {
       this.tusUploads.delete(uploadId);
       this.speedTracker.reset(uploadId);
+      this.lastProgressEmit.delete(uploadId);
 
       this.updateEntry(uploadId, {
         status: 'failed',
@@ -920,6 +926,7 @@ export class TusdTracker {
     if (entry.retryCount >= this.config.maxRetries) {
       this.tusUploads.delete(uploadId);
       this.speedTracker.reset(uploadId);
+      this.lastProgressEmit.delete(uploadId);
 
       this.updateEntry(uploadId, {
         status: 'failed',
@@ -1048,10 +1055,10 @@ export class TusdTracker {
   private emitStats(): void {
     const stats = this.computeStats();
 
-    // Only emit if meaningful change (at least 0.5% progress difference or upload count change)
+    // Only emit if meaningful change (at least threshold percent difference or upload count change)
     if (
       this.lastStatsSnapshot &&
-      Math.abs(stats.overallPercent - this.lastStatsSnapshot.overallPercent) < 0.5 &&
+      Math.abs(stats.overallPercent - this.lastStatsSnapshot.overallPercent) < this.STATS_DEBOUNCE_THRESHOLD &&
       stats.uploading === this.lastStatsSnapshot.uploading &&
       stats.queued === this.lastStatsSnapshot.queued &&
       stats.done === this.lastStatsSnapshot.done &&
@@ -1088,7 +1095,8 @@ export class TusdTracker {
     const listeners = this.listeners.get(event);
     if (!listeners) return;
 
-    for (const listener of listeners) {
+    // Create a copy before iteration to prevent issues if listeners are modified during iteration
+    for (const listener of Array.from(listeners)) {
       listener(data);
     }
   }
