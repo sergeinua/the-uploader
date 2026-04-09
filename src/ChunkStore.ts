@@ -3,6 +3,20 @@ import type { ChunkState, ChunkStatus, UploadId } from './types';
 const DB_NAME = 'tusd-tracker';
 const DB_VERSION = 1;
 const STORE_NAME = 'chunks';
+const METADATA_STORE = 'uploads';
+
+export interface UploadMetadataState {
+  uploadId: UploadId;
+  fileName: string;
+  fileSize: number;
+  fileType: string;
+  uploadUrl?: string | undefined;
+  bytesUploaded: number;
+  startedAt: number;
+  metadata: Record<string, string>;
+  priority?: number | undefined;
+  tags?: string[] | undefined;
+}
 
 export class ChunkStore {
   private db: IDBDatabase | null = null;
@@ -30,13 +44,17 @@ export class ChunkStore {
 
       request.onupgradeneeded = (event) => {
         const db = (event.target as IDBOpenDBRequest).result;
-        
+
         if (!db.objectStoreNames.contains(STORE_NAME)) {
           const store = db.createObjectStore(STORE_NAME, {
             keyPath: ['uploadId', 'chunkIndex'],
           });
           store.createIndex('by-upload', 'uploadId', { unique: false });
           store.createIndex('by-status', 'status', { unique: false });
+        }
+
+        if (!db.objectStoreNames.contains(METADATA_STORE)) {
+          db.createObjectStore(METADATA_STORE, { keyPath: 'uploadId' });
         }
       };
     });
@@ -55,8 +73,13 @@ export class ChunkStore {
       const store = tx.objectStore(STORE_NAME);
       const request = store.put(chunk);
 
-      request.onsuccess = () => {};
-      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        // Individual put success - transaction will complete
+      };
+      request.onerror = () => {
+        tx.abort();
+        reject(request.error);
+      };
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
@@ -176,5 +199,79 @@ export class ChunkStore {
       this.db = null;
       this.initPromise = null;
     }
+  }
+
+  // Metadata persistence methods
+
+  async saveMetadata(metadata: UploadMetadataState): Promise<void> {
+    if (typeof indexedDB === 'undefined' || this.db === null) return;
+
+    await this.init();
+    if (this.db === null) return;
+
+    return new Promise<void>((resolve, reject) => {
+      const tx = this.db!.transaction(METADATA_STORE, 'readwrite');
+      const store = tx.objectStore(METADATA_STORE);
+      const request = store.put(metadata);
+
+      request.onsuccess = () => {
+        // Individual put success - transaction will complete
+      };
+      request.onerror = () => {
+        tx.abort();
+        reject(request.error);
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async getMetadata(uploadId: UploadId): Promise<UploadMetadataState | undefined> {
+    if (typeof indexedDB === 'undefined' || this.db === null) return undefined;
+
+    await this.init();
+    if (this.db === null) return undefined;
+
+    return new Promise<UploadMetadataState | undefined>((resolve, reject) => {
+      const tx = this.db!.transaction(METADATA_STORE, 'readonly');
+      const store = tx.objectStore(METADATA_STORE);
+      const request = store.get(uploadId);
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    });
+  }
+
+  async deleteMetadata(uploadId: UploadId): Promise<void> {
+    if (typeof indexedDB === 'undefined' || this.db === null) return;
+
+    await this.init();
+    if (this.db === null) return;
+
+    return new Promise<void>((resolve, reject) => {
+      const tx = this.db!.transaction(METADATA_STORE, 'readwrite');
+      const store = tx.objectStore(METADATA_STORE);
+      const request = store.delete(uploadId);
+
+      request.onerror = () => reject(request.error);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async getAllMetadata(): Promise<UploadMetadataState[]> {
+    if (typeof indexedDB === 'undefined' || this.db === null) return [];
+
+    await this.init();
+    if (this.db === null) return [];
+
+    return new Promise<UploadMetadataState[]>((resolve, reject) => {
+      const tx = this.db!.transaction(METADATA_STORE, 'readonly');
+      const store = tx.objectStore(METADATA_STORE);
+      const request = store.getAll();
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result || []);
+    });
   }
 }

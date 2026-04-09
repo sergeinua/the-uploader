@@ -29,6 +29,10 @@ const DEFAULT_CONFIG: {
   persistState: boolean;
   diagnosticsEndpoint: string | null;
   headers: Record<string, string>;
+  maxFileSize: number | null;
+  maxTotalUploadSize: number | null;
+  verifyChecksums: boolean;
+  debug: boolean;
 } = {
   chunkSize: 5 * 1024 * 1024,
   maxRetries: 5,
@@ -40,6 +44,10 @@ const DEFAULT_CONFIG: {
   persistState: true,
   diagnosticsEndpoint: null,
   headers: {},
+  maxFileSize: null,
+  maxTotalUploadSize: null,
+  verifyChecksums: false,
+  debug: false,
 };
 
 type Listener<K extends TrackerEventName> = (data: TrackerEventMap[K]) => void;
@@ -56,6 +64,10 @@ export class TusdTracker {
     persistState: boolean;
     diagnosticsEndpoint: string | null;
     headers: Record<string, string>;
+    maxFileSize: number | null;
+    maxTotalUploadSize: number | null;
+    verifyChecksums: boolean;
+    debug: boolean;
   };
 
   private entries: Map<UploadId, UploadEntry> = new Map();
@@ -69,6 +81,13 @@ export class TusdTracker {
   private healthChecker: HealthChecker;
   private diagnosticsReporter?: DiagnosticsReporter;
   private statsInterval?: number;
+
+  // Progress throttling
+  private progressThrottleMs = 100;
+  private lastProgressEmit = new Map<UploadId, number>();
+
+  // Stats debouncing
+  private lastStatsSnapshot: TrackerStats | null = null;
 
   constructor(config: TusdTrackerConfig) {
     // Validate config values
@@ -131,23 +150,74 @@ export class TusdTracker {
   /**
    * Add a new file upload to the queue.
    * @param file - The file to upload (File object or FileLike interface for Node.js)
-   * @param metadata - Optional metadata to attach to the upload
+   * @param options - Optional metadata and priority for the upload
    * @returns Array of upload entry IDs
    */
-  add(file: File | File[], metadata?: Record<string, string>): UploadId[] {
+  add(
+    file: File | File[],
+    options?: Record<string, string> | { metadata?: Record<string, string>; priority?: number; tags?: string[] }
+  ): UploadId[] {
     const files = Array.isArray(file) ? file : [file];
     const ids: UploadId[] = [];
 
+    // Parse options - support both old (metadata only) and new (object with metadata, priority, tags) formats
+    let metadata: Record<string, string> = {};
+    let priority: number | undefined;
+    let tags: string[] | undefined;
+
+    if (options) {
+      const hasOptionFields = 'metadata' in options || 'priority' in options || 'tags' in options;
+      
+      if (hasOptionFields) {
+        // New format with options object
+        const opts = options as { metadata?: Record<string, string>; priority?: number; tags?: string[] };
+        metadata = opts.metadata ?? {};
+        priority = opts.priority;
+        tags = opts.tags;
+      } else {
+        // Old format - just metadata
+        metadata = options as Record<string, string>;
+      }
+    }
+
+    // Validate file sizes
     for (const f of files) {
-      const entry = this.createEntry(f, metadata ?? {});
+      if (this.config.maxFileSize !== null && f.size > this.config.maxFileSize) {
+        throw new Error(`File "${f.name}" (${this.formatBytes(f.size)}) exceeds max size limit (${this.formatBytes(this.config.maxFileSize)})`);
+      }
+    }
+
+    // Validate total upload size
+    if (this.config.maxTotalUploadSize !== null) {
+      const currentTotal = Array.from(this.entries.values())
+        .reduce((sum, e) => sum + e.bytesTotal, 0);
+      const newTotal = files.reduce((sum, f) => sum + f.size, 0);
+      if (currentTotal + newTotal > this.config.maxTotalUploadSize) {
+        throw new Error(
+          `Total upload size would exceed max limit of ${this.formatBytes(this.config.maxTotalUploadSize)}`
+        );
+      }
+    }
+
+    for (const f of files) {
+      const entry = this.createEntry(f, metadata, priority, tags);
       this.entries.set(entry.id, entry);
       ids.push(entry.id);
       this.queue.push(entry.id);
+      this.debug('Added upload:', entry.id, f.name, f.size);
     }
 
     this.emitStats();
     this.drainQueue();
     return ids;
+  }
+
+  private formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i]!;
   }
 
   /**
@@ -217,12 +287,14 @@ export class TusdTracker {
     }
 
     this.entries.delete(uploadId);
-    
+
     if (this.config.persistState) {
       this.chunkStore.deleteByUpload(uploadId).catch(console.error);
+      this.chunkStore.deleteMetadata(uploadId).catch(console.error);
     }
 
     this.speedTracker.reset(uploadId);
+    this.speedTracker.cleanupIdle();
     this.emit('entry:cancelled', entry);
     this.emitStats();
   }
@@ -258,15 +330,74 @@ export class TusdTracker {
   retryFailed(): void {
     const failed = Array.from(this.entries.values())
       .filter((e) => e.status === 'failed');
-    
+
     for (const entry of failed) {
       entry.status = 'queued';
       entry.retryCount = 0;
       delete entry.error;
       this.queue.push(entry.id);
     }
-    
+
     this.drainQueue();
+  }
+
+  /**
+   * Pause multiple uploads at once.
+   * @param uploadIds - Array of upload IDs to pause
+   */
+  pauseBatch(uploadIds: UploadId[]): void {
+    for (const id of uploadIds) {
+      this.pause(id);
+    }
+  }
+
+  /**
+   * Cancel and remove multiple uploads at once.
+   * @param uploadIds - Array of upload IDs to cancel
+   */
+  cancelBatch(uploadIds: UploadId[]): void {
+    for (const id of uploadIds) {
+      this.cancel(id);
+    }
+  }
+
+  /**
+   * Retry multiple failed uploads at once.
+   * @param uploadIds - Array of upload IDs to retry
+   */
+  retryBatch(uploadIds: UploadId[]): void {
+    for (const id of uploadIds) {
+      const entry = this.entries.get(id);
+      if (entry && entry.status === 'failed') {
+        entry.status = 'queued';
+        entry.retryCount = 0;
+        delete entry.error;
+        this.queue.push(id);
+      }
+    }
+    this.drainQueue();
+  }
+
+  /**
+   * Get entries filtered by status.
+   * @param status - Upload status to filter by
+   * @returns Array of upload entries with the specified status
+   */
+  getEntriesByStatus(status: UploadStatus): UploadEntry[] {
+    return Array.from(this.entries.values())
+      .filter((e) => e.status === status)
+      .sort((a, b) => b.startedAt - a.startedAt);
+  }
+
+  /**
+   * Get entries filtered by tags.
+   * @param tag - Tag to filter by
+   * @returns Array of upload entries that include the specified tag
+   */
+  getEntriesByTag(tag: string): UploadEntry[] {
+    return Array.from(this.entries.values())
+      .filter((e) => e.tags?.includes(tag))
+      .sort((a, b) => b.startedAt - a.startedAt);
   }
 
   /**
@@ -360,17 +491,130 @@ export class TusdTracker {
       clearInterval(this.statsInterval);
     }
 
+    // Clean up speed tracker samples
+    this.speedTracker.clear();
+
     // Clear all listeners
     this.listeners.clear();
   }
 
-  private createEntry(file: File | { name: string; size: number; type: string }, metadata: Record<string, string>): UploadEntry {
+  /**
+   * Restore uploads from persisted metadata (e.g., after page reload).
+   * This allows resuming uploads that were in progress before the page was closed.
+   * @returns Array of restored upload IDs
+   */
+  async restoreFromPersistence(): Promise<UploadId[]> {
+    if (!this.config.persistState) return [];
+
+    await this.chunkStore.init();
+    const metadataList = await this.chunkStore.getAllMetadata();
+    const restoredIds: UploadId[] = [];
+
+    for (const meta of metadataList) {
+      // Skip if already in memory
+      if (this.entries.has(meta.uploadId)) continue;
+
+      // Create a minimal file-like object for restoration
+      const fileLike = {
+        name: meta.fileName,
+        size: meta.fileSize,
+        type: meta.fileType,
+      };
+
+      const entry: UploadEntry = {
+        id: meta.uploadId,
+        file: fileLike,
+        uploadUrl: meta.uploadUrl || undefined,
+        status: 'paused',
+        bytesTotal: meta.fileSize,
+        bytesUploaded: meta.bytesUploaded,
+        percent: meta.fileSize > 0 ? (meta.bytesUploaded / meta.fileSize) * 100 : 0,
+        chunkSize: this.config.chunkSize,
+        totalChunks: Math.ceil(meta.fileSize / this.config.chunkSize),
+        successChunks: 0,
+        failedChunks: 0,
+        lostChunks: 0,
+        startedAt: meta.startedAt,
+        speed: 0,
+        eta: 0,
+        retryCount: 0,
+        metadata: meta.metadata,
+        priority: meta.priority || undefined,
+        tags: meta.tags || undefined,
+      };
+
+      this.entries.set(entry.id, entry);
+      restoredIds.push(entry.id);
+    }
+
+    if (restoredIds.length > 0) {
+      this.emitStats();
+    }
+
+    return restoredIds;
+  }
+
+  /**
+   * Validate server capabilities before starting uploads.
+   * Checks if the tusd server is reachable and what features it supports.
+   * @returns Validation result with server capabilities or error
+   */
+  async validateServer(): Promise<{
+    ok: boolean;
+    maxSize?: string | null;
+    supportedExtensions?: string[];
+    version?: string | null;
+    error?: string;
+  }> {
+    try {
+      const response = await fetch(this.config.endpoint, {
+        method: 'OPTIONS',
+        headers: {
+          'Tus-Resumable': '1.0.0',
+          ...this.config.headers,
+        },
+      });
+
+      if (!response.ok) {
+        return {
+          ok: false,
+          error: `Server responded with status ${response.status}`,
+        };
+      }
+
+      const tusExtension = response.headers.get('Tus-Extension');
+      const tusMaxSize = response.headers.get('Tus-Max-Size');
+      const tusVersion = response.headers.get('Tus-Resumable');
+
+      return {
+        ok: true,
+        maxSize: tusMaxSize,
+        supportedExtensions: tusExtension ? tusExtension.split(',') : [],
+        version: tusVersion,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: (err as Error).message,
+      };
+    }
+  }
+
+  private createEntry(
+    file: File | { name: string; size: number; type: string },
+    metadata: Record<string, string>,
+    priority?: number,
+    tags?: string[]
+  ): UploadEntry {
     const id = generateId();
     const chunkSize = this.config.chunkSize;
     const bytesTotal = file.size;
     const totalChunks = Math.ceil(bytesTotal / chunkSize);
 
-    return {
+    // Sanitize metadata to prevent header injection
+    const sanitizedMetadata = this.sanitizeMetadata(metadata);
+
+    const entry: UploadEntry = {
       id,
       file,
       status: 'queued',
@@ -386,14 +630,57 @@ export class TusdTracker {
       speed: 0,
       eta: 0,
       retryCount: 0,
-      metadata,
+      metadata: sanitizedMetadata,
+      ...(priority !== undefined && { priority }),
+      ...(tags !== undefined && { tags }),
     };
+
+    // Persist metadata for resume across sessions
+    if (this.config.persistState) {
+      this.saveMetadata(entry).catch(console.error);
+    }
+
+    return entry;
+  }
+
+  /**
+   * Sanitize metadata to prevent header injection attacks.
+   * Only allows alphanumeric keys with hyphens and underscores.
+   * Removes carriage returns and newlines from values.
+   */
+  private sanitizeMetadata(metadata: Record<string, string>): Record<string, string> {
+    const sanitized: Record<string, string> = {};
+    for (const [key, value] of Object.entries(metadata)) {
+      // Only allow alphanumeric keys with hyphens and underscores
+      if (/^[a-zA-Z0-9_-]+$/.test(key)) {
+        // Remove carriage returns and newlines to prevent header injection
+        sanitized[key] = value.replace(/[\r\n]/g, '');
+      }
+    }
+    return sanitized;
+  }
+
+  private async saveMetadata(entry: UploadEntry): Promise<void> {
+    const metadataState = {
+      uploadId: entry.id,
+      fileName: entry.file.name,
+      fileSize: entry.file.size,
+      fileType: entry.file.type,
+      uploadUrl: entry.uploadUrl,
+      bytesUploaded: entry.bytesUploaded,
+      startedAt: entry.startedAt,
+      metadata: entry.metadata,
+      priority: entry.priority,
+      tags: entry.tags,
+    };
+    await this.chunkStore.saveMetadata(metadataState);
   }
 
   private startUpload(uploadId: UploadId): void {
     const entry = this.entries.get(uploadId);
     if (!entry) return;
 
+    this.debug('Starting upload:', uploadId, entry.file.name);
     this.updateEntry(uploadId, { status: 'uploading' });
 
     const tusOptions: tus.UploadOptions = {
@@ -442,7 +729,12 @@ export class TusdTracker {
       })
       .catch((err) => {
         console.error('[TusdTracker] Error finding previous uploads:', err);
-        console.error('[TusdTracker] Starting upload from scratch due to error');
+        // Emit warning event for observability
+        this.emit('upload:warning', {
+          uploadId,
+          type: 'previous_upload_lookup_failed',
+          error: err as Error,
+        });
         // Start from scratch if we can't find previous uploads
         tusUpload.start();
       });
@@ -451,6 +743,16 @@ export class TusdTracker {
   private handleProgress(uploadId: UploadId, bytesUploaded: number): void {
     const entry = this.entries.get(uploadId);
     if (!entry) return;
+
+    // Throttle progress updates to reduce callback overhead
+    const now = Date.now();
+    const lastEmit = this.lastProgressEmit.get(uploadId) ?? 0;
+
+    if (now - lastEmit < this.progressThrottleMs) {
+      return;  // Throttle
+    }
+
+    this.lastProgressEmit.set(uploadId, now);
 
     const percent = (bytesUploaded / entry.bytesTotal) * 100;
     this.speedTracker.record(uploadId, bytesUploaded);
@@ -471,7 +773,7 @@ export class TusdTracker {
 
     // Calculate chunk index from bytesUploaded
     const chunkIndex = Math.floor(entry.bytesUploaded / entry.chunkSize);
-    
+
     const chunkState: ChunkState = {
       uploadId,
       chunkIndex,
@@ -480,6 +782,9 @@ export class TusdTracker {
       status: 'success',
       attempts: 1,
       lastAttempt: Date.now(),
+      checksum: this.config.verifyChecksums
+        ? await this.computeChunkChecksum(entry, chunkIndex)
+        : undefined,
     };
 
     if (this.config.persistState) {
@@ -491,10 +796,36 @@ export class TusdTracker {
     });
   }
 
+  private async computeChunkChecksum(
+    entry: UploadEntry,
+    chunkIndex: number
+  ): Promise<string | undefined> {
+    // Only compute checksum if we have access to the file data
+    // This is limited because we can't always read the specific chunk in browser
+    if (!(entry.file instanceof File) && !(entry.file instanceof Blob)) {
+      return undefined;
+    }
+
+    try {
+      const start = chunkIndex * entry.chunkSize;
+      const end = Math.min(start + entry.chunkSize, entry.bytesTotal);
+      const blob = entry.file.slice(start, end);
+      const buffer = await blob.arrayBuffer();
+
+      // Import crc32 function dynamically
+      const { crc32 } = await import('./utils/checksum');
+      return crc32(buffer);
+    } catch {
+      // If we can't compute the checksum, return undefined
+      return undefined;
+    }
+  }
+
   private handleSuccess(uploadId: UploadId): void {
     const entry = this.entries.get(uploadId);
     if (!entry) return;
 
+    this.debug('Upload completed:', uploadId, entry.file.name);
     this.tusUploads.delete(uploadId);
     this.speedTracker.reset(uploadId);
 
@@ -518,6 +849,37 @@ export class TusdTracker {
   private async handleError(uploadId: UploadId, error: Error): Promise<void> {
     const entry = this.entries.get(uploadId);
     if (!entry) return;
+
+    // Classify the error to determine retry strategy
+    const classification = this.classifyError(error);
+
+    // For non-retryable errors, fail immediately
+    if (classification === 'non-retryable') {
+      this.tusUploads.delete(uploadId);
+      this.speedTracker.reset(uploadId);
+
+      this.updateEntry(uploadId, {
+        status: 'failed',
+        error: error.message,
+      });
+
+      const entrySnapshot = { ...entry };
+      this.emit('entry:failed', entrySnapshot);
+
+      if (this.config.onError) {
+        this.config.onError(entrySnapshot, error);
+      }
+      return;
+    }
+
+    // For network errors when offline, wait for network before retrying
+    if (classification === 'network' && !this.networkMonitor.isOnline()) {
+      this.updateEntry(uploadId, {
+        status: 'paused',
+        error: error.message,
+      });
+      return;
+    }
 
     entry.retryCount++;
 
@@ -580,7 +942,36 @@ export class TusdTracker {
     }
   }
 
+  private classifyError(error: Error): 'retryable' | 'non-retryable' | 'network' {
+    const message = error.message.toLowerCase();
+
+    // Non-retryable: client errors that won't resolve with retry
+    if (message.includes('404') || message.includes('unsupported')) {
+      return 'non-retryable';
+    }
+
+    // Network errors: may benefit from waiting for online
+    if (message.includes('network') || message.includes('fetch')) {
+      return 'network';
+    }
+
+    return 'retryable';
+  }
+
+  private debug(...args: unknown[]): void {
+    if (this.config.debug) {
+      console.log('[TusdTracker]', ...args);
+    }
+  }
+
   private drainQueue(): void {
+    // Sort queue by priority before processing (higher priority first)
+    this.queue.sort((a, b) => {
+      const entryA = this.entries.get(a);
+      const entryB = this.entries.get(b);
+      return (entryB?.priority ?? 0) - (entryA?.priority ?? 0);
+    });
+
     while (
       this.tusUploads.size < this.config.parallelUploads &&
       this.queue.length > 0
@@ -629,11 +1020,16 @@ export class TusdTracker {
       if (entry.status === 'uploading' || entry.status === 'recovering') {
         stats.uploading++;
         stats.currentSpeed += entry.speed;
-      } else if (entry.status === 'queued' || entry.status === 'done' || 
-                 entry.status === 'failed' || entry.status === 'paused' || 
-                 entry.status === 'cancelled') {
-        stats[entry.status]++;
+      } else if (entry.status === 'queued') {
+        stats.queued++;
+      } else if (entry.status === 'done') {
+        stats.done++;
+      } else if (entry.status === 'failed') {
+        stats.failed++;
+      } else if (entry.status === 'paused') {
+        stats.paused++;
       }
+      // 'cancelled' status is not tracked in stats
       
       stats.totalBytes += entry.bytesTotal;
       stats.uploadedBytes += entry.bytesUploaded;
@@ -651,6 +1047,20 @@ export class TusdTracker {
 
   private emitStats(): void {
     const stats = this.computeStats();
+
+    // Only emit if meaningful change (at least 0.5% progress difference or upload count change)
+    if (
+      this.lastStatsSnapshot &&
+      Math.abs(stats.overallPercent - this.lastStatsSnapshot.overallPercent) < 0.5 &&
+      stats.uploading === this.lastStatsSnapshot.uploading &&
+      stats.queued === this.lastStatsSnapshot.queued &&
+      stats.done === this.lastStatsSnapshot.done &&
+      stats.failed === this.lastStatsSnapshot.failed
+    ) {
+      return;  // No significant change, skip emission
+    }
+
+    this.lastStatsSnapshot = stats;
     this.emit('stats:update', stats);
     if (this.config.onStatsUpdate) {
       this.config.onStatsUpdate(stats);

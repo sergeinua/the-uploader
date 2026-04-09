@@ -21,6 +21,16 @@ export interface FileLike {
   type: string;
 }
 
+/**
+ * Upload metadata with strict typing for common keys.
+ * Custom metadata keys must be alphanumeric with hyphens/underscores.
+ */
+export interface UploadMetadata {
+  filename?: string;
+  filetype?: string;
+  [key: string]: string | undefined;
+}
+
 export interface ChunkState {
   uploadId: UploadId;
   chunkIndex: number;
@@ -29,14 +39,25 @@ export interface ChunkState {
   status: ChunkStatus;
   attempts: number;
   lastAttempt: number;   // unix ms
-  checksum?: string;     // optional CRC32 hex
-  error?: string;
+  checksum?: string | undefined;     // optional CRC32 hex
+  error?: string | undefined;
 }
+
+/**
+ * Discriminated union type for chunk states (alternative to ChunkState).
+ * Provides more type safety for complex state management.
+ */
+export type ChunkStateUnion =
+  | { type: 'pending'; uploadId: UploadId; chunkIndex: number }
+  | { type: 'uploading'; uploadId: UploadId; chunkIndex: number; startedAt: number }
+  | { type: 'success'; uploadId: UploadId; chunkIndex: number; completedAt: number }
+  | { type: 'failed'; uploadId: UploadId; chunkIndex: number; error: string; attempts: number }
+  | { type: 'lost'; uploadId: UploadId; chunkIndex: number; detectedAt: number };
 
 export interface UploadEntry {
   id: UploadId;
   file: File | FileLike;
-  uploadUrl?: string;          // set after tusd creates the upload
+  uploadUrl?: string | undefined;    // set after tusd creates the upload
   status: UploadStatus;
   bytesTotal: number;
   bytesUploaded: number;
@@ -47,14 +68,16 @@ export interface UploadEntry {
   failedChunks: number;
   lostChunks: number;          // count of confirmed lost chunks
   startedAt: number;           // unix ms
-  finishedAt?: number;
+  finishedAt?: number | undefined;
   speed: number;               // bytes/sec (rolling average)
   eta: number;                 // seconds remaining
   retryCount: number;
-  serverOffset?: number;       // last confirmed HEAD offset
-  offsetDiff?: number;         // localOffset − serverOffset
-  error?: string;
+  serverOffset?: number | undefined;  // last confirmed HEAD offset
+  offsetDiff?: number | undefined;    // localOffset − serverOffset
+  error?: string | undefined;
   metadata: Record<string, string>;
+  priority?: number | undefined;      // higher = more urgent, default: 0
+  tags?: string[] | undefined;        // for grouping/filtering
 }
 
 export interface OffsetDiagnosis {
@@ -99,6 +122,10 @@ export interface TusdTrackerConfig {
   persistState?: boolean;               // default: true (IndexedDB)
   diagnosticsEndpoint?: string | null;   // optional POST URL
   headers?: Record<string, string>;     // extra headers for all tus requests
+  maxFileSize?: number | null;          // max single file size in bytes
+  maxTotalUploadSize?: number | null;   // max total bytes across all uploads
+  verifyChecksums?: boolean;            // enable chunk checksum verification
+  debug?: boolean;                      // enable verbose debug logging
   onProgress?: (entry: UploadEntry) => void;
   onComplete?: (entry: UploadEntry) => void;
   onError?: (entry: UploadEntry, error: Error) => void;
@@ -114,6 +141,7 @@ export type TrackerEventMap = {
   'entry:cancelled': UploadEntry;
   'stats:update': TrackerStats;
   'chunk:lost': { uploadId: UploadId; diagnosis: OffsetDiagnosis };
+  'upload:warning': { uploadId: UploadId; type: string; error: Error };
   'network:online': void;
   'network:offline': void;
 };
